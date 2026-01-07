@@ -14,8 +14,9 @@ import { v4 as uuidv4 } from 'uuid';
 import { authenticate, runAuthCommand, AuthServer, initializeOAuth2Client } from './auth.js';
 import { z } from 'zod';
 import { fileURLToPath } from 'url';
-import { readFileSync } from 'fs';
-import { join, dirname } from 'path';
+import { readFileSync, statSync } from 'fs';
+import { join, dirname, basename, extname } from 'path';
+import { Readable } from 'stream';
 
 // Drive service - will be created with auth when needed
 let drive: any = null;
@@ -104,6 +105,57 @@ function getExtensionFromFilename(filename: string): string {
 function getMimeTypeFromFilename(filename: string): string {
   const ext = getExtensionFromFilename(filename);
   return TEXT_MIME_TYPES[ext as keyof typeof TEXT_MIME_TYPES] || 'text/plain';
+}
+
+/**
+ * Detect MIME type from file extension for binary files
+ */
+function detectMimeType(filename: string): string {
+  const ext = getExtensionFromFilename(filename).toLowerCase();
+
+  const mimeTypes: { [key: string]: string } = {
+    // Documents
+    'pdf': 'application/pdf',
+    'doc': 'application/msword',
+    'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'xls': 'application/vnd.ms-excel',
+    'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'ppt': 'application/vnd.ms-powerpoint',
+    'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    // Images
+    'jpg': 'image/jpeg',
+    'jpeg': 'image/jpeg',
+    'png': 'image/png',
+    'gif': 'image/gif',
+    'bmp': 'image/bmp',
+    'webp': 'image/webp',
+    'svg': 'image/svg+xml',
+    // Text
+    'txt': 'text/plain',
+    'md': 'text/markdown',
+    'json': 'application/json',
+    'xml': 'application/xml',
+    'csv': 'text/csv',
+    // Archives
+    'zip': 'application/zip',
+    'rar': 'application/x-rar-compressed',
+    'tar': 'application/x-tar',
+    'gz': 'application/gzip',
+    '7z': 'application/x-7z-compressed',
+    // Audio/Video
+    'mp3': 'audio/mpeg',
+    'mp4': 'video/mp4',
+    'avi': 'video/x-msvideo',
+    'mov': 'video/quicktime',
+    'wav': 'audio/wav',
+    // Other
+    'html': 'text/html',
+    'css': 'text/css',
+    'js': 'application/javascript',
+    'ts': 'application/typescript'
+  };
+
+  return mimeTypes[ext] || 'application/octet-stream';
 }
 
 
@@ -323,6 +375,20 @@ const UpdateGoogleSheetSchema = z.object({
   spreadsheetId: z.string().min(1, "Spreadsheet ID is required"),
   range: z.string().min(1, "Range is required"),
   data: z.array(z.array(z.string()))
+});
+
+const UploadFileSchema = z.object({
+  name: z.string().min(1, "File name is required"),
+  content: z.string().min(1, "File content is required (base64-encoded)"),
+  mimeType: z.string().min(1, "MIME type is required (e.g., 'application/pdf')"),
+  parentFolderId: z.string().optional()
+});
+
+const UploadFileFromPathSchema = z.object({
+  filePath: z.string().min(1, "File path is required"),
+  name: z.string().optional(),
+  mimeType: z.string().optional(),
+  parentFolderId: z.string().optional()
 });
 
 const GetGoogleSheetContentSchema = z.object({
@@ -745,6 +811,62 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             parentFolderId: { type: "string", description: "Optional parent folder ID", optional: true }
           },
           required: ["name", "content"]
+        }
+      },
+      {
+        name: "uploadFile",
+        description: "Upload a binary file (PDF, image, etc.) to Google Drive. The file content must be base64-encoded.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: {
+              type: "string",
+              description: "Name of the file including extension (e.g., 'report.pdf', 'photo.jpg')"
+            },
+            content: {
+              type: "string",
+              description: "Base64-encoded file content"
+            },
+            mimeType: {
+              type: "string",
+              description: "MIME type of the file (e.g., 'application/pdf', 'image/jpeg', 'image/png')"
+            },
+            parentFolderId: {
+              type: "string",
+              description: "Optional parent folder ID or path (e.g., '/Documents'). Defaults to root.",
+              optional: true
+            }
+          },
+          required: ["name", "content", "mimeType"]
+        }
+      },
+      {
+        name: "uploadFileFromPath",
+        description: "Upload a file to Google Drive by providing a local file path. The server will read and upload the file automatically. Use this when you have a file path on the user's system.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            filePath: {
+              type: "string",
+              description: "Absolute path to the file on the local filesystem (e.g., '/Users/username/Documents/file.pdf')"
+            },
+            name: {
+              type: "string",
+              description: "Optional custom name for the file in Google Drive. If not provided, uses the original filename.",
+              optional: true
+            },
+            mimeType: {
+              type: "string",
+              description: "Optional MIME type. If not provided, will be auto-detected from file extension.",
+              optional: true
+            },
+            parentFolderId: {
+              type: "string",
+              description: "Optional parent folder ID or path (e.g., '/Documents'). Defaults to root.",
+              optional: true
+            }
+          },
+          required: ["filePath"]
         }
       },
       {
@@ -1483,6 +1605,182 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [{
             type: "text",
             text: `Created file: ${file.data?.name || args.name}\nID: ${file.data?.id || 'unknown'}`
+          }],
+          isError: false
+        };
+      }
+
+      case "uploadFile": {
+        const validation = UploadFileSchema.safeParse(request.params.arguments);
+        if (!validation.success) {
+          return errorResponse(validation.error.errors[0].message);
+        }
+        const args = validation.data;
+
+        // Resolve parent folder (supports both IDs and paths)
+        const parentFolderId = await resolveFolderId(args.parentFolderId);
+
+        // Check if file already exists
+        const existingFileId = await checkFileExists(args.name, parentFolderId);
+        if (existingFileId) {
+          return errorResponse(
+            `A file named "${args.name}" already exists in this location (ID: ${existingFileId}). ` +
+            `Please rename the file or delete the existing one first.`
+          );
+        }
+
+        // Decode base64 content to Buffer
+        let fileBuffer: Buffer;
+        try {
+          fileBuffer = Buffer.from(args.content, 'base64');
+        } catch (decodeError) {
+          return errorResponse(
+            `Failed to decode base64 content: ${decodeError instanceof Error ? decodeError.message : 'Invalid base64 string'}`
+          );
+        }
+
+        // Validate file size (recommended limit of 100 MB)
+        const fileSizeMB = fileBuffer.length / (1024 * 1024);
+        if (fileSizeMB > 100) {
+          return errorResponse(
+            `File size (${fileSizeMB.toFixed(2)} MB) exceeds the recommended limit of 100 MB for MCP uploads.`
+          );
+        }
+
+        // Create file metadata
+        const fileMetadata = {
+          name: args.name,
+          mimeType: args.mimeType,
+          parents: [parentFolderId]
+        };
+
+        // Convert Buffer to Readable stream for Google Drive API
+        const fileStream = Readable.from(fileBuffer);
+
+        // Upload file to Google Drive
+        const file = await drive.files.create({
+          requestBody: fileMetadata,
+          media: {
+            mimeType: args.mimeType,
+            body: fileStream,
+          },
+          fields: 'id, name, webViewLink, mimeType, size',
+          supportsAllDrives: true
+        });
+
+        log('Binary file uploaded successfully', {
+          fileId: file.data?.id,
+          name: file.data?.name,
+          mimeType: file.data?.mimeType,
+          size: file.data?.size
+        });
+
+        return {
+          content: [{
+            type: "text",
+            text: `Uploaded file: ${file.data?.name || args.name}\n` +
+                  `ID: ${file.data?.id || 'unknown'}\n` +
+                  `Type: ${file.data?.mimeType || args.mimeType}\n` +
+                  `Size: ${file.data?.size ? (parseInt(file.data.size) / 1024).toFixed(2) + ' KB' : 'unknown'}\n` +
+                  `Link: ${file.data?.webViewLink || 'N/A'}`
+          }],
+          isError: false
+        };
+      }
+
+      case "uploadFileFromPath": {
+        const validation = UploadFileFromPathSchema.safeParse(request.params.arguments);
+        if (!validation.success) {
+          return errorResponse(validation.error.errors[0].message);
+        }
+        const args = validation.data;
+
+        // Check if file exists
+        try {
+          const fileStats = statSync(args.filePath);
+          if (!fileStats.isFile()) {
+            return errorResponse(`Path is not a file: ${args.filePath}`);
+          }
+
+          // Check file size
+          const fileSizeMB = fileStats.size / (1024 * 1024);
+          if (fileSizeMB > 100) {
+            return errorResponse(
+              `File size (${fileSizeMB.toFixed(2)} MB) exceeds the recommended limit of 100 MB.`
+            );
+          }
+        } catch (error) {
+          return errorResponse(
+            `Cannot access file: ${error instanceof Error ? error.message : 'File not found'}`
+          );
+        }
+
+        // Determine file name
+        const fileName = args.name || basename(args.filePath);
+
+        // Detect or use provided MIME type
+        const mimeType = args.mimeType || detectMimeType(fileName);
+
+        // Resolve parent folder
+        const parentFolderId = await resolveFolderId(args.parentFolderId);
+
+        // Check if file already exists
+        const existingFileId = await checkFileExists(fileName, parentFolderId);
+        if (existingFileId) {
+          return errorResponse(
+            `A file named "${fileName}" already exists in this location (ID: ${existingFileId}). ` +
+            `Please rename the file or delete the existing one first.`
+          );
+        }
+
+        // Read file from disk
+        let fileBuffer: Buffer;
+        try {
+          fileBuffer = readFileSync(args.filePath);
+        } catch (readError) {
+          return errorResponse(
+            `Failed to read file: ${readError instanceof Error ? readError.message : 'Unknown error'}`
+          );
+        }
+
+        // Convert Buffer to Readable stream
+        const fileStream = Readable.from(fileBuffer);
+
+        // Create file metadata
+        const fileMetadata = {
+          name: fileName,
+          mimeType: mimeType,
+          parents: [parentFolderId]
+        };
+
+        // Upload to Google Drive
+        const file = await drive.files.create({
+          requestBody: fileMetadata,
+          media: {
+            mimeType: mimeType,
+            body: fileStream,
+          },
+          fields: 'id, name, webViewLink, mimeType, size',
+          supportsAllDrives: true
+        });
+
+        log('File uploaded from path successfully', {
+          sourcePath: args.filePath,
+          fileId: file.data?.id,
+          name: file.data?.name,
+          mimeType: file.data?.mimeType,
+          size: file.data?.size
+        });
+
+        return {
+          content: [{
+            type: "text",
+            text: `Uploaded file from: ${args.filePath}\n` +
+                  `File name: ${file.data?.name || fileName}\n` +
+                  `ID: ${file.data?.id || 'unknown'}\n` +
+                  `Type: ${file.data?.mimeType || mimeType}\n` +
+                  `Size: ${file.data?.size ? (parseInt(file.data.size) / 1024).toFixed(2) + ' KB' : 'unknown'}\n` +
+                  `Link: ${file.data?.webViewLink || 'N/A'}`
           }],
           isError: false
         };

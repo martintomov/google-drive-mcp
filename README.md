@@ -4,7 +4,7 @@ A Model Context Protocol (MCP) server that provides secure integration with Goog
 
 ## Features
 
-- **Multi-format Support**: Work with Google Docs, Sheets, Slides, and regular files
+- **Multi-format Support**: Work with Google Docs, Sheets, Slides, regular text files, and binary files (PDFs, images)
 - **File Management**: Create, update, delete, rename, and move files and folders
 - **Advanced Search**: Search across your entire Google Drive
 - **Shared Drives Support**: Full access to Google Shared Drives (formerly Team Drives) in addition to My Drive
@@ -114,19 +114,7 @@ and Budget Spreadsheet template.
 
 ## Installation
 
-### Option 1: Use with npx (Recommended)
-
-You can run the server directly without installation:
-
-```bash
-# Run the server (authentication happens automatically on first run)
-npx @piotr-agier/google-drive-mcp
-
-# Optional: Run authentication manually if needed
-npx @piotr-agier/google-drive-mcp auth
-```
-
-### Option 2: Local Installation
+### Local Installation
 
 1. Clone and install:
    ```bash
@@ -149,6 +137,31 @@ npx @piotr-agier/google-drive-mcp auth
    ```
    
    Note: Authentication happens automatically on first run of an MCP client if you skip this step.
+
+## Setup for Cursor
+
+### Configure Cursor's MCP Settings
+
+Cursor uses the same MCP configuration format as Claude Desktop. Add this to your Cursor MCP config:
+
+**macOS/Linux**: `~/.cursor/mcp_config.json`
+**Windows**: `%APPDATA%\Cursor\mcp_config.json`
+
+```json
+{
+  "mcpServers": {
+    "google-drive": {
+      "command": "node",
+      "args": [
+        "/Users/martintomov/google-drive-mcp/dist/index.js"
+      ],
+      "env": {
+        "GOOGLE_DRIVE_OAUTH_CREDENTIALS": "/Users/martintomov/google-drive-mcp/gcp-oauth.keys.json"
+      }
+    }
+  }
+}
+```
 
 ## Docker Usage
 
@@ -320,6 +333,18 @@ Add the server to your Claude Desktop configuration:
   - `fileId`: File ID to update
   - `content`: New content
   - `name`: New name (optional)
+
+- **uploadFile** - Upload binary files (PDFs, images, etc.) to Google Drive (requires base64-encoded content)
+  - `name`: File name with extension (e.g., 'document.pdf', 'photo.jpg')
+  - `content`: Base64-encoded file content
+  - `mimeType`: MIME type (e.g., 'application/pdf', 'image/jpeg', 'image/png')
+  - `parentFolderId`: Parent folder ID or path (optional)
+
+- **uploadFileFromPath** - Upload a file by providing a local file path (recommended for MCP clients)
+  - `filePath`: Absolute path to file on local filesystem (e.g., '/Users/username/file.pdf')
+  - `name`: Custom name for the file in Google Drive (optional, uses original filename if omitted)
+  - `mimeType`: MIME type (optional, auto-detected from extension if omitted)
+  - `parentFolderId`: Parent folder ID or path (optional)
 
 - **deleteItem** - Move a file or folder to trash (not a permanent deletion - items can be restored from Google Drive trash)
   - `itemId`: Item ID to move to trash
