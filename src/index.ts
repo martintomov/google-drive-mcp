@@ -17,6 +17,8 @@ import { fileURLToPath } from 'url';
 import { readFileSync, statSync } from 'fs';
 import { join, dirname, basename, extname } from 'path';
 import { Readable } from 'stream';
+import { tempManager } from './tempManager.js';
+import { splitPdf, splitPdfIntoPages } from './pythonRunner.js';
 
 // Drive service - will be created with auth when needed
 let drive: any = null;
@@ -389,6 +391,19 @@ const UploadFileFromPathSchema = z.object({
   name: z.string().optional(),
   mimeType: z.string().optional(),
   parentFolderId: z.string().optional()
+});
+
+const UploadPdfWithSplitSchema = z.object({
+  filePath: z.string().min(1, "File path is required"),
+  splitMode: z.enum(["none", "pages", "ranges"]),
+  ranges: z.array(z.object({
+    start: z.number().int().min(1, "Start page must be at least 1"),
+    end: z.number().int().min(1, "End page must be at least 1"),
+    title: z.string().optional()
+  })).optional(),
+  parentFolder: z.string().optional(),
+  createSubfolder: z.boolean().default(true),
+  subfolderName: z.string().optional()
 });
 
 const GetGoogleSheetContentSchema = z.object({
@@ -867,6 +882,54 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             }
           },
           required: ["filePath"]
+        }
+      },
+      {
+        name: "uploadPdfWithSplit",
+        description: "Upload a local PDF file to Google Drive with optional splitting into pages or custom ranges. Perfect for uploading large multi-page PDFs as separate files organized in a folder.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            filePath: {
+              type: "string",
+              description: "Absolute path to the PDF file on the local filesystem"
+            },
+            splitMode: {
+              type: "string",
+              enum: ["none", "pages", "ranges"],
+              description: "Split mode: 'none' (upload as-is), 'pages' (split into individual pages), or 'ranges' (split by custom page ranges)"
+            },
+            ranges: {
+              type: "array",
+              description: "Array of page ranges for splitMode='ranges'. Each range has start (1-based), end, and optional title.",
+              items: {
+                type: "object",
+                properties: {
+                  start: { type: "number", description: "Starting page number (1-based)" },
+                  end: { type: "number", description: "Ending page number (inclusive)" },
+                  title: { type: "string", description: "Optional custom name for this range", optional: true }
+                },
+                required: ["start", "end"]
+              },
+              optional: true
+            },
+            parentFolder: {
+              type: "string",
+              description: "Optional parent folder ID or path where files will be uploaded. Defaults to root.",
+              optional: true
+            },
+            createSubfolder: {
+              type: "boolean",
+              description: "Whether to create a subfolder for split files (default: true). Only applies when splitMode is not 'none'.",
+              optional: true
+            },
+            subfolderName: {
+              type: "string",
+              description: "Optional custom name for the subfolder. Defaults to '<filename>-pages' or '<filename>-split'.",
+              optional: true
+            }
+          },
+          required: ["filePath", "splitMode"]
         }
       },
       {
@@ -1784,6 +1847,203 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }],
           isError: false
         };
+      }
+
+      case "uploadPdfWithSplit": {
+        const validation = UploadPdfWithSplitSchema.safeParse(request.params.arguments);
+        if (!validation.success) {
+          return errorResponse(validation.error.errors[0].message);
+        }
+        const args = validation.data;
+
+        // Validate PDF file exists
+        try {
+          const fileStats = statSync(args.filePath);
+          if (!fileStats.isFile()) {
+            return errorResponse(`Path is not a file: ${args.filePath}`);
+          }
+
+          // Check if it's a PDF
+          const ext = extname(args.filePath).toLowerCase();
+          if (ext !== '.pdf') {
+            return errorResponse(
+              `File must be a PDF. Got: ${ext || 'no extension'}`
+            );
+          }
+
+          // Check file size (500 MB max for PDF processing)
+          const fileSizeMB = fileStats.size / (1024 * 1024);
+          if (fileSizeMB > 500) {
+            return errorResponse(
+              `PDF file size (${fileSizeMB.toFixed(2)} MB) exceeds the maximum limit of 500 MB.`
+            );
+          }
+
+          log('PDF validation passed', {
+            filePath: args.filePath,
+            sizeMB: fileSizeMB.toFixed(2),
+            splitMode: args.splitMode
+          });
+        } catch (error) {
+          return errorResponse(
+            `Cannot access PDF file: ${error instanceof Error ? error.message : 'File not found'}`
+          );
+        }
+
+        // Validate ranges if splitMode is "ranges"
+        if (args.splitMode === "ranges") {
+          if (!args.ranges || args.ranges.length === 0) {
+            return errorResponse(
+              'splitMode "ranges" requires at least one range in the "ranges" array'
+            );
+          }
+
+          // Validate each range
+          for (const range of args.ranges) {
+            if (range.start > range.end) {
+              return errorResponse(
+                `Invalid range: start page (${range.start}) must be <= end page (${range.end})`
+              );
+            }
+          }
+        }
+
+        let tempDir: string | null = null;
+
+        try {
+          let filesToUpload: string[] = [];
+          const pdfBaseName = basename(args.filePath, '.pdf');
+
+          if (args.splitMode === "none") {
+            // Direct upload - no splitting
+            filesToUpload = [args.filePath];
+          } else {
+            // Create temp directory for split files
+            tempDir = await tempManager.createTempDir('pdf-split');
+            log('Created temp directory', { tempDir });
+
+            if (args.splitMode === "pages") {
+              // Split into individual pages
+              log('Splitting PDF into individual pages...');
+              filesToUpload = await splitPdfIntoPages(args.filePath, tempDir);
+              log('PDF split into pages', { pageCount: filesToUpload.length });
+            } else if (args.splitMode === "ranges") {
+              // Split by custom ranges
+              log('Splitting PDF by custom ranges...', { rangeCount: args.ranges!.length });
+              filesToUpload = await splitPdf(args.filePath, tempDir, args.ranges!);
+              log('PDF split by ranges', { fileCount: filesToUpload.length });
+            }
+          }
+
+          // Resolve parent folder
+          const parentFolderId = await resolveFolderId(args.parentFolder);
+          let targetFolderId = parentFolderId;
+
+          // Create subfolder if needed
+          if (args.createSubfolder && args.splitMode !== "none") {
+            const defaultSubfolderName = args.splitMode === "pages"
+              ? `${pdfBaseName}-pages`
+              : `${pdfBaseName}-split`;
+            const subfolderName = args.subfolderName || defaultSubfolderName;
+
+            log('Creating subfolder', { name: subfolderName, parent: parentFolderId });
+
+            const folder = await drive.files.create({
+              requestBody: {
+                name: subfolderName,
+                mimeType: FOLDER_MIME_TYPE,
+                parents: [parentFolderId]
+              },
+              fields: 'id, name',
+              supportsAllDrives: true
+            });
+
+            targetFolderId = folder.data.id!;
+            log('Subfolder created', { folderId: targetFolderId, name: folder.data.name });
+          }
+
+          // Upload all files
+          const uploadedFiles: Array<{name: string, id: string, link: string}> = [];
+
+          for (let i = 0; i < filesToUpload.length; i++) {
+            const filePath = filesToUpload[i];
+            const fileName = basename(filePath);
+
+            log(`Uploading file ${i + 1}/${filesToUpload.length}`, { fileName });
+
+            // Read file
+            const fileBuffer = readFileSync(filePath);
+            const fileStream = Readable.from(fileBuffer);
+
+            // Upload to Google Drive
+            const file = await drive.files.create({
+              requestBody: {
+                name: fileName,
+                mimeType: 'application/pdf',
+                parents: [targetFolderId]
+              },
+              media: {
+                mimeType: 'application/pdf',
+                body: fileStream
+              },
+              fields: 'id, name, webViewLink',
+              supportsAllDrives: true
+            });
+
+            uploadedFiles.push({
+              name: file.data.name || fileName,
+              id: file.data.id || 'unknown',
+              link: file.data.webViewLink || 'N/A'
+            });
+
+            log(`File uploaded ${i + 1}/${filesToUpload.length}`, {
+              fileId: file.data.id,
+              name: file.data.name
+            });
+          }
+
+          // Build response
+          const response = {
+            totalFiles: uploadedFiles.length,
+            files: uploadedFiles,
+            folderId: targetFolderId,
+            folderLink: `https://drive.google.com/drive/folders/${targetFolderId}`
+          };
+
+          log('Upload completed successfully', {
+            totalFiles: response.totalFiles,
+            folderId: response.folderId
+          });
+
+          return {
+            content: [{
+              type: "text",
+              text: `PDF upload completed!\n\n` +
+                    `Mode: ${args.splitMode}\n` +
+                    `Total files: ${response.totalFiles}\n` +
+                    `Folder ID: ${response.folderId}\n` +
+                    `Folder link: ${response.folderLink}\n\n` +
+                    `Files:\n` +
+                    uploadedFiles.map((f, idx) =>
+                      `${idx + 1}. ${f.name}\n   ID: ${f.id}\n   Link: ${f.link}`
+                    ).join('\n\n')
+            }],
+            isError: false
+          };
+
+        } catch (error) {
+          log('PDF upload failed', { error });
+
+          return errorResponse(
+            `Failed to upload PDF: ${error instanceof Error ? error.message : 'Unknown error'}`
+          );
+        } finally {
+          // Cleanup temp directory
+          if (tempDir) {
+            log('Cleaning up temp directory', { tempDir });
+            await tempManager.cleanup(tempDir);
+          }
+        }
       }
 
       case "updateTextFile": {

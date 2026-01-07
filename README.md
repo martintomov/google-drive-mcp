@@ -5,6 +5,7 @@ A Model Context Protocol (MCP) server that provides secure integration with Goog
 ## Features
 
 - **Multi-format Support**: Work with Google Docs, Sheets, Slides, regular text files, and binary files (PDFs, images)
+- **PDF Processing**: Split large PDFs into individual pages or custom ranges before uploading to Drive
 - **File Management**: Create, update, delete, rename, and move files and folders
 - **Advanced Search**: Search across your entire Google Drive
 - **Shared Drives Support**: Full access to Google Shared Drives (formerly Team Drives) in addition to My Drive
@@ -59,9 +60,22 @@ a Meeting Notes template, Project Proposal template,
 and Budget Spreadsheet template.
 ```
 
+### 8. **PDF Processing and Upload**
+```
+Upload my 50-page report.pdf to Google Drive, splitting it into individual
+pages and organizing them in a folder called "Report Pages"
+
+OR
+
+Split my thesis.pdf into sections: pages 1-10 as "Introduction",
+pages 11-40 as "Main Content", and pages 41-50 as "Conclusion",
+then upload to the /Documents folder
+```
+
 ## Requirements
 
 - **Node.js**: Version 18 or higher (LTS recommended)
+- **Python 3**: Required for PDF processing features (PyPDF2, reportlab, Pillow will be installed automatically)
 - **Google Cloud Project**: With the following APIs enabled:
   - Google Drive API
   - Google Docs API
@@ -123,7 +137,14 @@ and Budget Spreadsheet template.
    npm install
    ```
 
-2. Set up credentials:
+2. Install Python dependencies (required for PDF splitting):
+   ```bash
+   cd python-scripts
+   pip install -r requirements.txt
+   cd ..
+   ```
+
+3. Set up credentials:
    ```bash
    # Copy the example file
    cp gcp-oauth.keys.example.json gcp-oauth.keys.json
@@ -131,7 +152,7 @@ and Budget Spreadsheet template.
    # Edit gcp-oauth.keys.json with your OAuth client ID
    ```
 
-3. Authenticate (optional):
+4. Authenticate (optional):
    ```bash
    npm run auth
    ```
@@ -345,6 +366,25 @@ Add the server to your Claude Desktop configuration:
   - `name`: Custom name for the file in Google Drive (optional, uses original filename if omitted)
   - `mimeType`: MIME type (optional, auto-detected from extension if omitted)
   - `parentFolderId`: Parent folder ID or path (optional)
+
+- **uploadPdfWithSplit** - Upload a local PDF with optional splitting into pages or custom ranges
+  - `filePath`: Absolute path to the PDF file on local filesystem
+  - `splitMode`: "none" (upload as-is), "pages" (split into individual pages), or "ranges" (split by custom page ranges)
+  - `ranges`: Array of page ranges for splitMode="ranges" (optional)
+    - Each range has `start` (1-based page number), `end` (1-based page number), and optional `title`
+  - `parentFolder`: Parent folder ID or path where files will be uploaded (optional)
+  - `createSubfolder`: Whether to create a subfolder for split files (default: true, only applies when splitMode is not "none")
+  - `subfolderName`: Custom name for the subfolder (optional, defaults to "<filename>-pages" or "<filename>-split")
+
+  **Examples:**
+  - Split 50-page PDF into individual pages: `{filePath: "/path/to/doc.pdf", splitMode: "pages"}`
+  - Split into custom sections: `{filePath: "/path/to/report.pdf", splitMode: "ranges", ranges: [{start: 1, end: 10, title: "Introduction"}, {start: 11, end: 30, title: "Analysis"}]}`
+  - Upload without splitting: `{filePath: "/path/to/doc.pdf", splitMode: "none"}`
+
+  **Requirements:**
+  - Python 3 must be installed on your system
+  - Python dependencies (automatically managed): PyPDF2, reportlab, Pillow
+  - Maximum PDF size: 500 MB
 
 - **deleteItem** - Move a file or folder to trash (not a permanent deletion - items can be restored from Google Drive trash)
   - `itemId`: Item ID to move to trash
