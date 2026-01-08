@@ -4014,7 +4014,12 @@ async function main() {
         console.error("Starting Google Drive MCP server...");
         const transport = new StdioServerTransport();
         await server.connect(transport);
-        log('Server started successfully');
+        const launchCommand = process.argv.slice(0, 2).join(' ');
+        log('Server started successfully', {
+          transport: 'stdio',
+          launchCommand,
+          note: 'No HTTP port; connect via MCP client using this command'
+        });
         
         // Set up graceful shutdown
         process.on("SIGINT", async () => {
